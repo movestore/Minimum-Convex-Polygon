@@ -145,6 +145,12 @@ shinyModule <- function(input, output, session, data) {
   # Fixed opacity for the MCP fills; the track lines stay solid.
   layer_opacity <- 0.4
   
+  # Groups offered in the layers control. Kept in variables because the
+  # downloads need to tell a basemap apart from an overlay when they read the
+  # visible groups back from the live map.
+  base_groups    <- c("TopoMap", "Aerial", "OpenStreetMap")
+  overlay_groups <- c("Tracks", "MCPs")
+  
   # The map is built in two parts. base_map() holds everything that never
   # depends on the inputs (tiles, scale bar, layers control); add_data_layers()
   # holds everything that does. renderLeaflet() below draws the base only, so
@@ -159,8 +165,8 @@ shinyModule <- function(input, output, session, data) {
       addProviderTiles("OpenStreetMap", group = "OpenStreetMap") %>%
       addScaleBar(position = "topleft") %>%
       addLayersControl(
-        baseGroups = c("TopoMap", "Aerial", "OpenStreetMap"),
-        overlayGroups = c("Tracks", "MCPs"),
+        baseGroups = base_groups,
+        overlayGroups = overlay_groups,
         options = layersControlOptions(collapsed = FALSE)
       )
   }
@@ -183,16 +189,8 @@ shinyModule <- function(input, output, session, data) {
                 layerId = "track_legend")
   }
   
-  # Full standalone widget, used by the HTML and PNG downloads only.
-  mmap <- reactive({
-    mcp_dat <- mcp_cal()
-    bounds <- as.vector(st_bbox(selected_data()))
-    
-    base_map() %>%
-      fitBounds(bounds[1], bounds[2], bounds[3], bounds[4]) %>%
-      add_data_layers(mcp_dat) %>%
-      # scrolable ledgend
-      onRender("function(el, x) {
+  # Keeps the legend scrollable when there are more tracks than fit on screen.
+  legend_scroll_js <- "function(el, x) {
         function cap(lg) {
           lg.style.maxHeight = '55vh';
           lg.style.overflowY = 'auto';
@@ -210,7 +208,49 @@ shinyModule <- function(input, output, session, data) {
             });
           });
         }).observe(el, { childList: true, subtree: true });
-      }")
+      }"
+  
+  # What the user is actually looking at. Leaflet reports the currently visible
+  # groups and the current view back to Shiny as input$leafmap_groups /
+  # _center / _zoom, so the downloads can reproduce the basemap picked in the
+  # layers control, the overlays still ticked and the pan/zoom, instead of
+  # always writing out the defaults.
+  map_view <- reactive({
+    groups <- input$leafmap_groups
+    picked <- intersect(base_groups, groups)
+    
+    list(
+      base     = if (length(picked) > 0) picked[1] else base_groups[1],
+      overlays = if (is.null(groups)) overlay_groups else intersect(overlay_groups, groups),
+      center   = input$leafmap_center,
+      zoom     = input$leafmap_zoom
+    )
+  })
+  
+  # Full standalone widget, used by the HTML and PNG downloads only.
+  mmap <- reactive({
+    mcp_dat <- mcp_cal()
+    view <- map_view()
+    
+    m <- base_map() %>% add_data_layers(mcp_dat)
+    
+    # Same section of the world as on screen. Before the live map has reported
+    # a view (nothing rendered yet) fall back to the extent of the selection.
+    m <- if (!is.null(view$center) && !is.null(view$zoom)) {
+      m %>% setView(lng = view$center$lng, lat = view$center$lat, zoom = view$zoom)
+    } else {
+      bounds <- as.vector(st_bbox(selected_data()))
+      m %>% fitBounds(bounds[1], bounds[2], bounds[3], bounds[4])
+    }
+    
+    # Drop the unticked overlays and switch to the chosen basemap. This has to
+    # come after addLayersControl(), which on its own leaves the first basemap
+    # of the list showing.
+    m %>%
+      hideGroup(c(setdiff(base_groups, view$base),
+                  setdiff(overlay_groups, view$overlays))) %>%
+      showGroup(view$base) %>%
+      onRender(legend_scroll_js)
   })
   
 
